@@ -20,7 +20,6 @@ DB_CONFIG = {
 }
 
 def get_connection():
-    # Aiven requires SSL, so we add ssl_disabled=False to the connection
     return mysql.connector.connect(**DB_CONFIG, ssl_disabled=False)
 
 # ============================================================
@@ -48,14 +47,6 @@ def get_all_commodities():
 
 @st.cache_data(ttl=3600)
 def get_recommendation(commodity):
-    """
-    Get buy/sell recommendation for a commodity using the VOLUME-WEIGHTED
-    AVERAGE price per state (not just the max reported price), matching
-    the project's stated methodology:
-        weighted_price = SUM(price * quantity) / SUM(quantity)
-    States with no arrival_quantity on the reference date are excluded,
-    since a price can't be fairly weighted without volume data.
-    """
     latest_date = get_latest_date(commodity)
     conn = get_connection()
 
@@ -92,15 +83,71 @@ def get_recommendation(commodity):
         'states_covered': len(df)
     }
 
-# NOTE: This loop is temporarily disabled in the app to prevent 20+ minute loading times on the cloud.
 @st.cache_data(ttl=3600)
-def get_top_commodities(top_n=5):
-    return [] # Returns empty so the app loads instantly
-
-# NOTE: This loop is temporarily disabled in the app to prevent 20+ minute loading times on the cloud.
-@st.cache_data(ttl=3600)
-def get_market_insights():
-    return {'all_recs': [], 'buy_counts': {}, 'sell_counts': {}, 'avg_margin': 0, 'top_margin': []}
+def get_top_commodities_and_insights():
+    """
+    MASSIVE OPTIMIZATION: Instead of looping 416 times in Python, 
+    this runs ONE query in MySQL to calculate everything.
+    """
+    conn = get_connection()
+    
+    # This complex query calculates the weighted average for EVERY state and EVERY commodity 
+    # on the latest date, then ranks them to find the buy/sell states, and sorts by profit.
+    query = """
+    WITH LatestDate AS (
+        SELECT MAX(date) as max_date FROM commodity_prices WHERE modal_price > 0
+    ),
+    StatePrices AS (
+        SELECT commodity, state, 
+               SUM(modal_price * arrival_quantity) / SUM(arrival_quantity) as weighted_price
+        FROM commodity_prices
+        WHERE date = (SELECT max_date FROM LatestDate) AND modal_price > 0 AND arrival_quantity > 0
+        GROUP BY commodity, state
+        HAVING SUM(arrival_quantity) > 10
+    ),
+    MinMax AS (
+        SELECT commodity, 
+               MIN(weighted_price) as min_price, 
+               MAX(weighted_price) as max_price
+        FROM StatePrices
+        GROUP BY commodity
+        HAVING COUNT(state) > 1
+    )
+    SELECT sp_buy.commodity, 
+           sp_buy.state as buy_state, sp_buy.weighted_price as buy_price,
+           sp_sell.state as sell_state, sp_sell.weighted_price as sell_price,
+           (sp_sell.weighted_price - sp_buy.weighted_price) as gross_profit,
+           ((sp_sell.weighted_price - sp_buy.weighted_price) / sp_buy.weighted_price * 100) as margin_pct
+    FROM MinMax mm
+    JOIN StatePrices sp_buy ON mm.commodity = sp_buy.commodity AND mm.min_price = sp_buy.weighted_price
+    JOIN StatePrices sp_sell ON mm.commodity = sp_sell.commodity AND mm.max_price = sp_sell.weighted_price
+    ORDER BY gross_profit DESC
+    """
+    
+    df = pd.read_sql(query, conn)
+    conn.close()
+    
+    if df.empty:
+        return [], {}
+        
+    # Process into format for Top 5
+    top5 = df.head(5).to_dict('records')
+    
+    # Process into format for Insights
+    buy_counts = df['buy_state'].value_counts().to_dict()
+    sell_counts = df['sell_state'].value_counts().to_dict()
+    avg_margin = round(df['margin_pct'].mean(), 1)
+    top_margin = df.nlargest(5, 'margin_pct').to_dict('records')
+    
+    insights = {
+        'all_recs': df.to_dict('records'),
+        'buy_counts': buy_counts,
+        'sell_counts': sell_counts,
+        'avg_margin': avg_margin,
+        'top_margin': top_margin
+    }
+    
+    return top5, insights
 
 # ============================================================
 # Streamlit App Config
@@ -108,7 +155,6 @@ def get_market_insights():
 st.set_page_config(page_title="Arbitrage Advisor", page_icon="🌾", layout="wide")
 
 def metric_card(label, value, sub=None, color="kpi-blue"):
-    """Render a color-coded metric card"""
     sub_html = f'<div class="kpi-label" style="margin-top:4px;">{sub}</div>' if sub else ""
     st.markdown(f"""
     <div class="kpi-card {color}">
@@ -120,79 +166,25 @@ def metric_card(label, value, sub=None, color="kpi-blue"):
 
 st.markdown("""
 <style>
-    header[data-testid="stHeader"] {
-        background: transparent;
-        height: 0;
-        min-height: 0;
-    }
+    header[data-testid="stHeader"] { background: transparent; height: 0; min-height: 0; }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-
-    .block-container {
-        padding-top: 1rem;
-        padding-bottom: 2rem;
-    }
-
+    .block-container { padding-top: 1rem; padding-bottom: 2rem; }
     .main-header {
         background: linear-gradient(120deg, #062E2B 0%, #04635A 55%, #00A896 100%);
-        padding: 26px 32px;
-        border-radius: 14px;
-        margin: 0 0 22px 0;
-        border: 1px solid rgba(0,168,150,0.35);
-        box-shadow: 0 0 24px rgba(0,168,150,0.15);
+        padding: 26px 32px; border-radius: 14px; margin: 0 0 22px 0;
+        border: 1px solid rgba(0,168,150,0.35); box-shadow: 0 0 24px rgba(0,168,150,0.15);
         text-align: center;
     }
-    .main-header h1 {
-        margin: 0;
-        font-size: 2.7rem;
-        color: #FFFFFF !important;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 12px;
-    }
-    .main-header p {
-        margin: 8px 0 0 0;
-        opacity: 0.85;
-        font-size: 1.05rem;
-        color: #CFEFEA !important;
-        text-align: center;
-    }
-
-    [data-testid="stMetric"] {
-        background-color: #16191C;
-        border: 1px solid rgba(255,255,255,0.08);
-        border-left: 3px solid #3A4046;
-        border-radius: 10px;
-        padding: 14px 16px;
-    }
-    [data-testid="stMetricLabel"] p {
-        color: #9AA5AB !important;
-    }
-    [data-testid="stMetricValue"] {
-        color: #F2F5F4 !important;
-    }
-    [data-testid="stMetricDelta"] {
-        color: #9AA5AB !important;
-    }
-
-    .kpi-card {
-        background-color: #16191C;
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 10px;
-        padding: 14px 16px;
-        height: 100%;
-    }
-    .kpi-card .kpi-label {
-        font-size: 0.82rem;
-        color: #9AA5AB;
-        margin-bottom: 4px;
-    }
-    .kpi-card .kpi-value {
-        font-size: 1.7rem;
-        font-weight: 700;
-        color: #F2F5F4;
-    }
+    .main-header h1 { margin: 0; font-size: 2.7rem; color: #FFFFFF !important; display: flex; align-items: center; justify-content: center; gap: 12px; }
+    .main-header p { margin: 8px 0 0 0; opacity: 0.85; font-size: 1.05rem; color: #CFEFEA !important; text-align: center; }
+    [data-testid="stMetric"] { background-color: #16191C; border: 1px solid rgba(255,255,255,0.08); border-left: 3px solid #3A4046; border-radius: 10px; padding: 14px 16px; }
+    [data-testid="stMetricLabel"] p { color: #9AA5AB !important; }
+    [data-testid="stMetricValue"] { color: #F2F5F4 !important; }
+    [data-testid="stMetricDelta"] { color: #9AA5AB !important; }
+    .kpi-card { background-color: #16191C; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 14px 16px; height: 100%; }
+    .kpi-card .kpi-label { font-size: 0.82rem; color: #9AA5AB; margin-bottom: 4px; }
+    .kpi-card .kpi-value { font-size: 1.7rem; font-weight: 700; color: #F2F5F4; }
     .kpi-blue   { border-left: 3px solid #38BDF8; }
     .kpi-amber  { border-left: 3px solid #FBBF24; }
     .kpi-purple { border-left: 3px solid #A78BFA; }
@@ -200,68 +192,21 @@ st.markdown("""
     .kpi-green  { border-left: 3px solid #34D399; }
     .kpi-red    { border-left: 3px solid #F87171; }
     .kpi-brown  { border-left: 3px solid #B45309; }
-
-    div[data-testid="stVerticalBlockBorderWrapper"] {
-        background-color: #14171A;
-        border: 1px solid rgba(255,255,255,0.08) !important;
-        border-radius: 12px;
-    }
-
-    .rank-card {
-        background: #191D20;
-        border: 1px solid rgba(255,255,255,0.08);
-        border-left: 3px solid #00A896;
-        border-radius: 8px;
-        padding: 12px 16px;
-        margin-bottom: 10px;
-    }
-    .rank-card .title {
-        font-weight: 600;
-        font-size: 1.02rem;
-        margin-bottom: 4px;
-        color: #F2F5F4 !important;
-    }
-    .rank-card .route {
-        font-size: 0.9rem;
-        color: #A7B0B4 !important;
-    }
-    .rank-card .profit {
-        font-weight: 700;
-        color: #FBBF24 !important;
-        margin-top: 4px;
-    }
+    div[data-testid="stVerticalBlockBorderWrapper"] { background-color: #14171A; border: 1px solid rgba(255,255,255,0.08) !important; border-radius: 12px; }
+    .rank-card { background: #191D20; border: 1px solid rgba(255,255,255,0.08); border-left: 3px solid #00A896; border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; }
+    .rank-card .title { font-weight: 600; font-size: 1.02rem; margin-bottom: 4px; color: #F2F5F4 !important; }
+    .rank-card .route { font-size: 0.9rem; color: #A7B0B4 !important; }
+    .rank-card .profit { font-weight: 700; color: #FBBF24 !important; margin-top: 4px; }
     .buy-tag { color: #34D399 !important; font-weight: 600; }
     .sell-tag { color: #F87171 !important; font-weight: 600; }
-
-    button[kind="primary"] {
-        background-color: #00A896 !important;
-        border-color: #00A896 !important;
-        color: #FFFFFF !important;
-    }
-    button[kind="primary"]:hover {
-        background-color: #028090 !important;
-        border-color: #028090 !important;
-    }
-
-    button[data-baseweb="tab"][aria-selected="true"] {
-        color: #2DD4BF !important;
-    }
-    div[data-baseweb="tab-highlight"] {
-        background-color: #2DD4BF !important;
-    }
-
-    footer.app-footer {
-        text-align: center;
-        color: #6B7A78 !important;
-        font-size: 0.82rem;
-        padding: 18px 0 4px 0;
-    }
+    button[kind="primary"] { background-color: #00A896 !important; border-color: #00A896 !important; color: #FFFFFF !important; }
+    button[kind="primary"]:hover { background-color: #028090 !important; border-color: #028090 !important; }
+    button[data-baseweb="tab"][aria-selected="true"] { color: #2DD4BF !important; }
+    div[data-baseweb="tab-highlight"] { background-color: #2DD4BF !important; }
+    footer.app-footer { text-align: center; color: #6B7A78 !important; font-size: 0.82rem; padding: 18px 0 4px 0; }
 </style>
 """, unsafe_allow_html=True)
 
-# ============================================================
-# Header
-# ============================================================
 st.markdown("""
 <div class="main-header">
     <h1>🚀 Agricultural Arbitrage Advisor</h1>
@@ -275,8 +220,8 @@ st.markdown("""
 commodities = get_all_commodities()
 overall_latest_date = get_latest_date()
 
-with st.spinner("Loading top opportunities..."):
-    top5 = get_top_commodities(5)
+with st.spinner("Calculating top opportunities..."):
+    top5, insights = get_top_commodities_and_insights()
 
 # ============================================================
 # KPI Strip
@@ -439,11 +384,8 @@ with tab1:
                     </div>
                     """, unsafe_allow_html=True)
             else:
-                st.write("Loading top opportunities is currently disabled on the web server. Please use the dropdown on the left to search for a specific commodity.")
+                st.write("No opportunities found today")
 
-    # ----------------------------------------------------------
-    # Visualization - uses the SAME date as the recommendation
-    # ----------------------------------------------------------
     rec = st.session_state.get("rec")
     if rec and rec['commodity'] == selected_commodity:
         st.markdown("---")
@@ -467,12 +409,9 @@ with tab1:
                 n = len(chart_df)
                 colors = []
                 for i in range(n):
-                    if i == 0:
-                        colors.append('#1B8A5A')
-                    elif i == n - 1:
-                        colors.append('#B00020')
-                    else:
-                        colors.append('#4682B4')
+                    if i == 0: colors.append('#1B8A5A')
+                    elif i == n - 1: colors.append('#B00020')
+                    else: colors.append('#4682B4')
 
                 fig = px.bar(
                     chart_df, x='state', y='max_price',
@@ -482,31 +421,14 @@ with tab1:
                 )
                 fig.update_traces(marker_color=colors, textposition='outside', textfont_color='#F2F5F4')
                 fig.update_layout(
-                    plot_bgcolor='#101B1A',
-                    paper_bgcolor='#101B1A',
-                    font=dict(color='#F2F5F4'),
-                    title_font=dict(color='#F2F5F4', size=16),
-                    xaxis_title="State",
-                    yaxis_title="Weighted Avg. Price (₹/Quintal)",
-                    xaxis_tickangle=-45,
-                    showlegend=False,
-                    height=420,
+                    plot_bgcolor='#101B1A', paper_bgcolor='#101B1A',
+                    font=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4', size=16),
+                    xaxis_title="State", yaxis_title="Weighted Avg. Price (₹/Quintal)",
+                    xaxis_tickangle=-45, showlegend=False, height=420,
                     margin=dict(t=50, b=10, l=10, r=10)
                 )
-                fig.update_xaxes(
-                    color='#F2F5F4',
-                    tickfont=dict(color='#F2F5F4'),
-                    title_font=dict(color='#F2F5F4'),
-                    linecolor='rgba(255,255,255,0.2)',
-                    gridcolor='rgba(255,255,255,0.08)'
-                )
-                fig.update_yaxes(
-                    color='#F2F5F4',
-                    tickfont=dict(color='#F2F5F4'),
-                    title_font=dict(color='#F2F5F4'),
-                    linecolor='rgba(255,255,255,0.2)',
-                    gridcolor='rgba(255,255,255,0.08)'
-                )
+                fig.update_xaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
+                fig.update_yaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
                 st.plotly_chart(fig, use_container_width=True, theme=None)
                 st.caption("🟢 Green = Buy (Cheapest)  |  🔴 Red = Sell (Most Expensive)  |  Volume-weighted average, same date as recommendation")
 
@@ -514,13 +436,12 @@ with tab1:
 # TAB 2: Market Insights
 # ------------------------------------------------------------
 with tab2:
-    insights = get_market_insights()
     all_recs = insights['all_recs']
     buy_counts = insights['buy_counts']
     sell_counts = insights['sell_counts']
 
     if not all_recs:
-        st.info("Market Insights loading is currently disabled on the web server to save resources. If you are running this locally, it will populate.")
+        st.info("No arbitrage data available yet.")
     else:
         top_buy_state = max(buy_counts, key=buy_counts.get)
         top_sell_state = max(sell_counts, key=sell_counts.get)
@@ -539,82 +460,36 @@ with tab2:
             with st.container(border=True):
                 st.subheader("💹 Best Return by % Margin")
                 st.caption("Ranked by profit as a % of buy price — not the same list as raw ₹ profit")
-
                 margin_df = pd.DataFrame(insights['top_margin']).sort_values('margin_pct')
-                fig3 = px.bar(
-                    margin_df, x='margin_pct', y='commodity', orientation='h',
-                    text=margin_df['margin_pct'].apply(lambda v: f"{v:.1f}%"),
-                    template='plotly_dark'
-                )
+                fig3 = px.bar(margin_df, x='margin_pct', y='commodity', orientation='h', text=margin_df['margin_pct'].apply(lambda v: f"{v:.1f}%"), template='plotly_dark')
                 fig3.update_traces(marker_color='#7B2CBF', textposition='outside', textfont_color='#F2F5F4')
-                fig3.update_layout(
-                    plot_bgcolor='#101B1A', paper_bgcolor='#101B1A',
-                    font=dict(color='#F2F5F4'),
-                    xaxis_title="Profit Margin (%)", yaxis_title="",
-                    height=360, margin=dict(t=20, b=10, l=10, r=10)
-                )
-                fig3.update_xaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'),
-                                   title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
-                fig3.update_yaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'),
-                                   title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
+                fig3.update_layout(plot_bgcolor='#101B1A', paper_bgcolor='#101B1A', font=dict(color='#F2F5F4'), xaxis_title="Profit Margin (%)", yaxis_title="", height=360, margin=dict(t=20, b=10, l=10, r=10))
+                fig3.update_xaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
+                fig3.update_yaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
                 st.plotly_chart(fig3, use_container_width=True, theme=None)
 
         with col_right:
             with st.container(border=True):
                 st.subheader("🟢 Best Sourcing States")
                 st.caption("How many commodities each state offers at the lowest price")
-
-                buy_df = pd.DataFrame(
-                    sorted(buy_counts.items(), key=lambda x: x[1]),
-                    columns=['state', 'count']
-                )
-                fig4 = px.bar(
-                    buy_df, x='count', y='state', orientation='h',
-                    text='count', template='plotly_dark'
-                )
+                buy_df = pd.DataFrame(sorted(buy_counts.items(), key=lambda x: x[1]), columns=['state', 'count'])
+                fig4 = px.bar(buy_df, x='count', y='state', orientation='h', text='count', template='plotly_dark')
                 fig4.update_traces(marker_color='#1B8A5A', textposition='outside', textfont_color='#F2F5F4')
-                fig4.update_layout(
-                    plot_bgcolor='#101B1A', paper_bgcolor='#101B1A',
-                    font=dict(color='#F2F5F4'),
-                    xaxis_title="Commodities Cheapest Here", yaxis_title="",
-                    height=360, margin=dict(t=20, b=10, l=10, r=10)
-                )
-                fig4.update_xaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'),
-                                   title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
-                fig4.update_yaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'),
-                                   title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
+                fig4.update_layout(plot_bgcolor='#101B1A', paper_bgcolor='#101B1A', font=dict(color='#F2F5F4'), xaxis_title="Commodities Cheapest Here", yaxis_title="", height=360, margin=dict(t=20, b=10, l=10, r=10))
+                fig4.update_xaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
+                fig4.update_yaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
                 st.plotly_chart(fig4, use_container_width=True, theme=None)
 
         with st.container(border=True):
             st.subheader("🎯 Price Spread Across All Commodities")
             st.caption("Each point is one commodity — further above the diagonal means a bigger arbitrage gap. Bubble size = gross profit.")
-
             scatter_df = pd.DataFrame(all_recs)
-            fig5 = px.scatter(
-                scatter_df, x='buy_price', y='sell_price',
-                size='gross_profit', color='margin_pct',
-                hover_name='commodity',
-                hover_data={'buy_state': True, 'sell_state': True, 'buy_price': ':.0f', 'sell_price': ':.0f', 'margin_pct': ':.1f'},
-                color_continuous_scale='Teal',
-                template='plotly_dark'
-            )
+            fig5 = px.scatter(scatter_df, x='buy_price', y='sell_price', size='gross_profit', color='margin_pct', hover_name='commodity', hover_data={'buy_state': True, 'sell_state': True, 'buy_price': ':.0f', 'sell_price': ':.0f', 'margin_pct': ':.1f'}, color_continuous_scale='Teal', template='plotly_dark')
             max_val = max(scatter_df['sell_price'].max(), scatter_df['buy_price'].max()) * 1.05
-            fig5.add_shape(
-                type='line', x0=0, y0=0, x1=max_val, y1=max_val,
-                line=dict(color='#CCCCCC', dash='dash')
-            )
-            fig5.update_layout(
-                plot_bgcolor='#101B1A', paper_bgcolor='#101B1A',
-                font=dict(color='#F2F5F4'),
-                xaxis_title="Cheapest State Price (₹/Quintal)",
-                yaxis_title="Priciest State Price (₹/Quintal)",
-                height=460, margin=dict(t=20, b=10, l=10, r=10),
-                coloraxis_colorbar=dict(title="Margin %", tickfont=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4'))
-            )
-            fig5.update_xaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'),
-                               title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
-            fig5.update_yaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'),
-                               title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
+            fig5.add_shape(type='line', x0=0, y0=0, x1=max_val, y1=max_val, line=dict(color='#CCCCCC', dash='dash'))
+            fig5.update_layout(plot_bgcolor='#101B1A', paper_bgcolor='#101B1A', font=dict(color='#F2F5F4'), xaxis_title="Cheapest State Price (₹/Quintal)", yaxis_title="Priciest State Price (₹/Quintal)", height=460, margin=dict(t=20, b=10, l=10, r=10), coloraxis_colorbar=dict(title="Margin %", tickfont=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4')))
+            fig5.update_xaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
+            fig5.update_yaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
             st.plotly_chart(fig5, use_container_width=True, theme=None)
 
 # ============================================================
