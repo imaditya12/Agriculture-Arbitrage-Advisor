@@ -85,14 +85,8 @@ def get_recommendation(commodity):
 
 @st.cache_data(ttl=3600)
 def get_top_commodities_and_insights():
-    """
-    MASSIVE OPTIMIZATION: Instead of looping 416 times in Python, 
-    this runs ONE query in MySQL to calculate everything.
-    """
     conn = get_connection()
     
-    # This complex query calculates the weighted average for EVERY state and EVERY commodity 
-    # on the latest date, then ranks them to find the buy/sell states, and sorts by profit.
     query = """
     WITH LatestDate AS (
         SELECT MAX(date) as max_date FROM commodity_prices WHERE modal_price > 0
@@ -130,10 +124,7 @@ def get_top_commodities_and_insights():
     if df.empty:
         return [], {}
         
-    # Process into format for Top 5
     top5 = df.head(5).to_dict('records')
-    
-    # Process into format for Insights
     buy_counts = df['buy_state'].value_counts().to_dict()
     sell_counts = df['sell_state'].value_counts().to_dict()
     avg_margin = round(df['margin_pct'].mean(), 1)
@@ -153,6 +144,9 @@ def get_top_commodities_and_insights():
 # Streamlit App Config
 # ============================================================
 st.set_page_config(page_title="Arbitrage Advisor", page_icon="🌾", layout="wide")
+
+# ADDED GOOGLE VERIFICATION HERE:
+st.markdown("<meta name='google-site-verification' content='googleab8507f23bd4295a' />", unsafe_allow_html=True)
 
 def metric_card(label, value, sub=None, color="kpi-blue"):
     sub_html = f'<div class="kpi-label" style="margin-top:4px;">{sub}</div>' if sub else ""
@@ -214,18 +208,12 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ============================================================
-# Load base data
-# ============================================================
 commodities = get_all_commodities()
 overall_latest_date = get_latest_date()
 
 with st.spinner("Calculating top opportunities..."):
     top5, insights = get_top_commodities_and_insights()
 
-# ============================================================
-# KPI Strip
-# ============================================================
 k1, k2, k3, k4 = st.columns(4)
 with k1:
     st.markdown(f"""
@@ -263,9 +251,6 @@ with k4:
 
 st.write("")
 
-# ============================================================
-# Sidebar
-# ============================================================
 with st.sidebar:
     st.header("📊 About This App")
     st.markdown(f"""
@@ -281,14 +266,8 @@ with st.sidebar:
     - Calculate your net profit by entering your costs
     """)
 
-# ============================================================
-# Tabs
-# ============================================================
 tab1, tab2 = st.tabs(["🔍 Find Opportunity", "📈 Market Insights"])
 
-# ------------------------------------------------------------
-# TAB 1: Find Opportunity
-# ------------------------------------------------------------
 with tab1:
     col1, col2 = st.columns([2, 1])
 
@@ -326,7 +305,6 @@ with tab1:
 
                 st.caption(f"📅 Based on data from: {rec['date']}  |  Weighted avg. across {rec['states_covered']} state(s)")
 
-                # Net Profit Calculator
                 st.markdown("---")
                 st.subheader("💡 Calculate Your Net Profit")
 
@@ -432,9 +410,6 @@ with tab1:
                 st.plotly_chart(fig, use_container_width=True, theme=None)
                 st.caption("🟢 Green = Buy (Cheapest)  |  🔴 Red = Sell (Most Expensive)  |  Volume-weighted average, same date as recommendation")
 
-# ------------------------------------------------------------
-# TAB 2: Market Insights
-# ------------------------------------------------------------
 with tab2:
     all_recs = insights['all_recs']
     buy_counts = insights['buy_counts']
@@ -492,9 +467,6 @@ with tab2:
             fig5.update_yaxes(color='#F2F5F4', tickfont=dict(color='#F2F5F4'), title_font=dict(color='#F2F5F4'), linecolor='rgba(255,255,255,0.2)', gridcolor='rgba(255,255,255,0.08)')
             st.plotly_chart(fig5, use_container_width=True, theme=None)
 
-# ============================================================
-# Footer
-# ============================================================
 st.markdown(f"""
 <footer class="app-footer">
     Data updated: {overall_latest_date} &nbsp;|&nbsp; Built with Streamlit 🌾
