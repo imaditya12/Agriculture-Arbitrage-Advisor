@@ -92,55 +92,15 @@ def get_recommendation(commodity):
         'states_covered': len(df)
     }
 
+# NOTE: This loop is temporarily disabled in the app to prevent 20+ minute loading times on the cloud.
 @st.cache_data(ttl=3600)
 def get_top_commodities(top_n=5):
-    commodities = get_all_commodities()
-    results = []
-    for commodity in commodities:
-        rec = get_recommendation(commodity)
-        if rec and rec['gross_profit'] > 0:
-            results.append({
-                'commodity': commodity,
-                'buy_state': rec['buy_state'],
-                'sell_state': rec['sell_state'],
-                'gross_profit': rec['gross_profit'],
-                'buy_price': rec['buy_price'],
-                'sell_price': rec['sell_price']
-            })
-    results = sorted(results, key=lambda x: x['gross_profit'], reverse=True)
-    return results[:top_n]
+    return [] # Returns empty so the app loads instantly
 
+# NOTE: This loop is temporarily disabled in the app to prevent 20+ minute loading times on the cloud.
 @st.cache_data(ttl=3600)
 def get_market_insights():
-    """
-    Aggregates arbitrage data across ALL commodities (not just top 5)
-    to surface patterns: profit margin %, which states are most
-    frequently the cheapest source / priciest market, etc.
-    """
-    commodities = get_all_commodities()
-    all_recs = []
-    for c in commodities:
-        rec = get_recommendation(c)
-        if rec and rec['gross_profit'] > 0 and rec['buy_price'] > 0:
-            rec = dict(rec)
-            rec['margin_pct'] = round((rec['gross_profit'] / rec['buy_price']) * 100, 1)
-            all_recs.append(rec)
-
-    buy_counts, sell_counts = {}, {}
-    for r in all_recs:
-        buy_counts[r['buy_state']] = buy_counts.get(r['buy_state'], 0) + 1
-        sell_counts[r['sell_state']] = sell_counts.get(r['sell_state'], 0) + 1
-
-    avg_margin = round(sum(r['margin_pct'] for r in all_recs) / len(all_recs), 1) if all_recs else 0
-    top_margin = sorted(all_recs, key=lambda x: x['margin_pct'], reverse=True)[:5]
-
-    return {
-        'all_recs': all_recs,
-        'buy_counts': buy_counts,
-        'sell_counts': sell_counts,
-        'avg_margin': avg_margin,
-        'top_margin': top_margin
-    }
+    return {'all_recs': [], 'buy_counts': {}, 'sell_counts': {}, 'avg_margin': 0, 'top_margin': []}
 
 # ============================================================
 # Streamlit App Config
@@ -479,7 +439,7 @@ with tab1:
                     </div>
                     """, unsafe_allow_html=True)
             else:
-                st.write("No opportunities found today")
+                st.write("Loading top opportunities is currently disabled on the web server. Please use the dropdown on the left to search for a specific commodity.")
 
     # ----------------------------------------------------------
     # Visualization - uses the SAME date as the recommendation
@@ -560,7 +520,7 @@ with tab2:
     sell_counts = insights['sell_counts']
 
     if not all_recs:
-        st.info("No arbitrage data available yet.")
+        st.info("Market Insights loading is currently disabled on the web server to save resources. If you are running this locally, it will populate.")
     else:
         top_buy_state = max(buy_counts, key=buy_counts.get)
         top_sell_state = max(sell_counts, key=sell_counts.get)
